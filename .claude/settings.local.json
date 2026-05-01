@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx nuxi@latest *)",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(npx wrangler *)",
+      "Bash(npx nuxt *)",
+      "Bash(curl -s http://127.0.0.1:8787/api/health)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s -X POST http://127.0.0.1:8787/api/analyze -H 'Content-Type: application/json' -d '{ *)",
+      "PowerShell(Get-Process *)"
+    ]
+  }
+}

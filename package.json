@@ -1,0 +1,28 @@
+{
+  "name": "company-analyzer",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare"
+  },
+  "dependencies": {
+    "langfuse": "^3.38.20",
+    "nuxt": "^4.4.2",
+    "openai": "^6.35.0",
+    "ulid": "^3.0.2",
+    "vue": "^3.5.33",
+    "vue-router": "^5.0.6",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260429.1",
+    "@tailwindcss/vite": "^4.2.4",
+    "lucide-vue-next": "^1.0.0",
+    "tailwindcss": "^4.2.4",
+    "wrangler": "^4.86.0"
+  }
+}

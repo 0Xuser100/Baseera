@@ -1,0 +1,50 @@
+name = "company-analyzer"
+main = ".output/server/index.mjs"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+persist = true
+head_sampling_rate = 1
+
+[[d1_databases]]
+binding = "DB"
+database_name = "company-analyzer-db"
+database_id = "2d689825-06f6-4b6c-8b40-fbd51472834f"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "company-analyzer-files"
+
+# Queues require Workers Paid plan ($5/mo) — disabled.
+# Re-enable to use Batch mode.
+# [[queues.producers]]
+# binding = "ANALYSIS_QUEUE"
+# queue = "analysis-jobs"
+#
+# [[queues.consumers]]
+# queue = "analysis-jobs"
+# max_batch_size = 10
+# max_batch_timeout = 5
+# max_retries = 3
+# dead_letter_queue = "analysis-jobs-dlq"
+
+[vars]
+APP_BASE_URL = "https://company-analyzer.thinktech-baseera.workers.dev"
+EMAIL_FROM   = "Company Analyzer <onboarding@resend.dev>"
+
+# Secrets (set via: wrangler secret put <NAME>)
+# TAVILY_API_KEY
+# OPENAI_API_KEY
+# ANTHROPIC_API_KEY
