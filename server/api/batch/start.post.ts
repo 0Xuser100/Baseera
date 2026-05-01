@@ -81,6 +81,15 @@ export default defineEventHandler(async (event) => {
     );
   }
 
+  if (!env.ANALYSIS_QUEUE) {
+    throw createError({
+      statusCode: 503,
+      message:
+        "Batch mode requires Cloudflare Queues (Workers Paid plan, $5/mo). " +
+        "Use Individual mode instead, or upgrade and uncomment the queues block in wrangler.toml.",
+    });
+  }
+
   const queueMessages = analyses.map((a) => ({
     body: { analysisId: a.id, batchId },
   }));

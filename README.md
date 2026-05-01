@@ -16,10 +16,19 @@
 
 Pick an LLM, a search strategy, and either:
 
-1. **Individual mode** → analyze one company in real-time
-2. **Batch mode** → upload an Excel of up to 1,000 companies, get an emailed `results.xlsx`
+1. **Individual mode** → analyze one company in real-time (server-side)
+2. **Batch mode** → upload an Excel of up to 1,000 companies. **Runs entirely in your browser** (no Cloudflare Queues / paid plan needed). Optional email notification when finished.
 
 The agent reads **only the company's own website** (domain-restricted search), then writes a sourced answer with citations.
+
+### Excel input format
+
+The xlsx must contain at least **one** of these columns (case-insensitive):
+
+- `name` / `company` / `company name` — company name
+- `domain` / `website` / `url` — company URL or domain
+
+If only a URL column is provided, the company name is auto-derived (e.g. `https://www.ejada.com` → name **Ejada**, domain **ejada.com**). Any extra columns are preserved and re-emitted in the output xlsx.
 
 ---
 
@@ -131,12 +140,13 @@ npx wrangler d1 create company-analyzer-db
 # R2 bucket
 npx wrangler r2 bucket create company-analyzer-files
 
-# Apply schema
-npx wrangler d1 execute company-analyzer-db --remote --file=migrations/0001_init.sql
+# Apply schema (managed via migrations folder)
+npx wrangler d1 migrations apply company-analyzer-db --remote
 
-# Queues (only if on Workers Paid plan)
-npx wrangler queues create analysis-jobs
-npx wrangler queues create analysis-jobs-dlq
+# Queues — ONLY if you upgrade to Workers Paid plan ($5/mo) and want server-side batch.
+# Skip this on the free plan; batch will run in the browser instead.
+# npx wrangler queues create analysis-jobs
+# npx wrangler queues create analysis-jobs-dlq
 ```
 
 ### Step 3 — Set secrets
@@ -170,44 +180,47 @@ npx wrangler deploy
 ## 🏗️ Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                       Cloudflare Edge                             │
-│                                                                   │
-│   ┌────────────┐         ┌─────────────────────────────────┐     │
-│   │  Browser   │ ──HTTP─►│   Nuxt 4 + Nitro (Worker)       │     │
-│   │  (Vue 3)   │         │   ├── Pages & Components        │     │
-│   └────────────┘         │   ├── /api/analyze              │     │
-│                          │   ├── /api/batch/start          │     │
-│                          │   └── /api/batch/[id]/*         │     │
-│                          └──┬──────────────────────────────┘     │
-│                             │                                     │
-│         ┌───────────────────┼─────────────────────────┐          │
-│         ▼                   ▼                         ▼          │
-│    ┌────────┐        ┌───────────┐             ┌──────────┐      │
-│    │   D1   │        │    R2     │             │  Queues  │      │
-│    │(SQLite)│        │  (xlsx)   │             │  (jobs)  │      │
-│    └────────┘        └───────────┘             └────┬─────┘      │
-│                                                     │            │
-│                                                     ▼            │
-│                                          ┌──────────────────┐    │
-│                                          │  Queue Consumer  │    │
-│                                          │  (1 job = 1 row) │    │
-│                                          └──────────────────┘    │
-└─────────────────────────────────┬─────────────────────────────────┘
-                                  │
-       ┌──────────────────────────┼──────────────────────┐
-       ▼                          ▼                      ▼
-  ┌─────────┐            ┌─────────────┐         ┌─────────────┐
-  │ Tavily  │            │   OpenAI    │         │   Resend    │
-  │ search  │            │ web_search  │         │  (emails)   │
-  └─────────┘            └─────────────┘         └─────────────┘
-                                │
-                                ▼
-                         ┌─────────────┐
-                         │  Langfuse   │
-                         │ (tracing)   │
-                         └─────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                          Browser (tab open)                      │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Vue 3 page (index.vue)                                   │  │
+│  │  ├── Parses xlsx with SheetJS                             │  │
+│  │  ├── Loops rows, 6 in parallel                            │  │
+│  │  ├── For each row: POST /api/analyze                      │  │
+│  │  ├── Generates results.xlsx client-side (download)        │  │
+│  │  └── On finish: POST /api/notify (optional email)         │  │
+│  └─────────────────────────┬─────────────────────────────────┘  │
+└────────────────────────────┼────────────────────────────────────┘
+                             │  HTTPS
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       Cloudflare Edge                            │
+│                                                                  │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │   Nuxt 4 + Nitro (Worker)                               │   │
+│   │   ├── /api/analyze   → orchestrator + provider call     │   │
+│   │   ├── /api/notify    → Resend email                     │   │
+│   │   └── /api/health                                       │   │
+│   └────┬────────────────────────────────────────────────────┘   │
+│        │                                                         │
+│        ▼                                                         │
+│   ┌────────┐                                                     │
+│   │   D1   │  one row per analysis (audit log)                  │
+│   │(SQLite)│                                                     │
+│   └────────┘                                                     │
+└────────────────────────────┬─────────────────────────────────────┘
+                             │
+       ┌─────────────────────┼─────────────────────┬──────────┐
+       ▼                     ▼                     ▼          ▼
+  ┌─────────┐          ┌─────────────┐       ┌────────┐  ┌──────────┐
+  │ Tavily  │          │   OpenAI    │       │ Resend │  │ Langfuse │
+  │ search  │          │ Responses + │       │ email  │  │ tracing  │
+  │         │          │ web_search  │       │        │  │          │
+  └─────────┘          └─────────────┘       └────────┘  └──────────┘
 ```
+
+> The dotted-out `R2 bucket` and `Queues + Consumer` from the original design are **still in the codebase** (`server/utils/queue-processor.ts`, `server/api/batch/*`) but disabled in `wrangler.toml`. Uncomment them and recreate the queues to switch back to server-side batch.
 
 ---
 
@@ -237,18 +250,59 @@ For `gpt-5.4-mini`, `reasoning.effort: "low"` is set to keep latency reasonable 
 
 ---
 
+## ⚙️ Active Configuration
+
+These are the parameters the app currently uses. Tune them by editing the file noted in each row.
+
+### LLM
+
+| Parameter | Value | Where it's set |
+|---|---|---|
+| Default LLM | `gpt-5.4-mini-2026-03-17` | UI selector (`app/components/ProviderSelector.vue`) |
+| Alternate LLM | `gpt-4o` | UI selector |
+| `max_output_tokens` | **800** | `server/utils/analyze.ts` |
+| `temperature` | `0.3` (chat models only) | `server/utils/providers/llm/openai.ts` |
+| `reasoning.effort` (gpt-5/o-models) | **`low`** | `server/utils/providers/llm/openai.ts` |
+| API used | OpenAI **Responses API** for reasoning models OR when web_search is needed; otherwise **Chat Completions** | `server/utils/providers/llm/openai.ts` |
+
+### Web search
+
+| Parameter | Value | Where it's set |
+|---|---|---|
+| Built-in search (OpenAI) — `search_context_size` | **`high`** | `server/utils/analyze.ts` |
+| Built-in search — `tool_choice` | `{ type: "web_search" }` (forced) | `server/utils/providers/llm/openai.ts` |
+| Built-in search — domain filter | `filters.allowed_domains: [<companyDomain>]` (max 100) | `server/utils/providers/llm/openai.ts` |
+| External search (Tavily) — `max_results` | **8** | `server/utils/analyze.ts` |
+| External search (Tavily) — `searchContextSize` | **`high`** | `server/utils/analyze.ts` |
+| External search (Tavily) — domain filter | `include_domains: [<companyDomain>]` | `server/utils/providers/search/tavily.ts` |
+
+### Batch mode (browser-side)
+
+| Parameter | Value | Where it's set |
+|---|---|---|
+| Execution | Runs **in the browser tab** — no server queue | `app/composables/useAnalyzer.ts` |
+| Concurrency | **6 rows in parallel** | `app/composables/useAnalyzer.ts` (`CONCURRENCY`) |
+| Max rows | **1,000** | `app/composables/useAnalyzer.ts` |
+| Email notify | Optional. Browser POSTs `/api/notify` after the loop completes (Resend) | `server/api/notify.post.ts` |
+| Output | Client-side xlsx download, no R2 storage | `app/composables/useAnalyzer.ts` (`downloadBatchResults`) |
+
+> **Want server-side batch back?** It's already wired (queue producer/consumer, R2 result storage, scheduled emails). Uncomment the `[[queues.*]]` blocks in `wrangler.toml`, run `npx wrangler queues create analysis-jobs && npx wrangler queues create analysis-jobs-dlq`, and switch `startBatch()` in `useAnalyzer.ts` back to the server flow. Requires Workers Paid ($5/mo).
+
+---
+
 ## 💰 Cost Comparison
 
-For 1,000 company analyses:
+Measured on real 20-row batches (one analysis per row), then linearly extrapolated. Numbers are **OpenAI cost only** — add Tavily fees if you exceed its free tier (1,000 calls/month).
 
-| Combo | Tool fees | LLM tokens | **Total** |
-|-------|-----------|------------|-----------|
-| Tavily + GPT-4o | ~$2 | ~$10 | **~$12** |
-| Tavily + GPT-5.4 Mini | ~$2 | ~$5 | **~$7** ⭐ cheapest |
-| OpenAI search + GPT-4o (medium ctx) | $25 | ~$10 | ~$35 |
-| OpenAI search + GPT-5.4 Mini (medium ctx) | $25 | ~$5 | ~$30 |
+| Combo | Per 20 (measured) | Per 1,000 (estimated) |
+|-------|---|---|
+| OpenAI search + **GPT-5.4 Mini** (`ctx=high`, current default) | $0.7297 | **~$36.49** |
+| OpenAI search + **GPT-4o-mini** equivalent (cheap LLM, `ctx=high`) | $0.1635 | **~$8.17** ⭐ cheapest |
+| Tavily + GPT-5.4 Mini | ~$0.10 | **~$5–10** |
 
-> Tip: For high-volume screening, use **Tavily + GPT-5.4 Mini**. For best quality on important leads, use **OpenAI + GPT-5.4 Mini**.
+**Tavily fees:** free up to 1,000 calls/month. Beyond that ~$30/mo for 4,000 calls.
+
+> Tip: For high-volume screening, use **Tavily + GPT-5.4 Mini**. For best quality on important leads, use **OpenAI search + GPT-5.4 Mini** with `ctx=high` (the current default).
 
 ---
 
@@ -257,15 +311,16 @@ For 1,000 company analyses:
 ```
 Baseera/
 ├── app/                          # Frontend (Vue + Nuxt)
-│   ├── pages/                    # Routes (index, batch/[id])
+│   ├── pages/                    # Routes — single-page (index.vue)
 │   ├── components/               # ProviderSelector, ResultCard, UploadZone
-│   ├── composables/              # useAnalyzer, useBatchPolling
+│   ├── composables/              # useAnalyzer (parses xlsx + runs batch in browser)
 │   └── assets/css/main.css       # Tailwind entry
 │
 ├── server/                       # Backend (Nitro)
 │   ├── api/                      # API routes
-│   │   ├── analyze.post.ts       # Individual mode
-│   │   ├── batch/                # Batch mode endpoints
+│   │   ├── analyze.post.ts       # Per-row analysis (called from individual + browser-batch)
+│   │   ├── notify.post.ts        # Sends batch-complete email (Resend)
+│   │   ├── batch/                # Server-side batch (kept for when Queues are enabled)
 │   │   └── health.get.ts
 │   ├── plugins/cloudflare-queue.ts
 │   └── utils/

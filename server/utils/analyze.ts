@@ -66,7 +66,7 @@ export async function analyzeCompany(input: AnalyzeInput): Promise<AnalyzeOutput
     const searchOutput = await search.search(query, {
       maxResults: 8,
       allowedDomains,
-      searchContextSize: "medium",
+      searchContextSize: "high",
     });
     results = searchOutput.results;
     allSources = searchOutput.allSources;
@@ -89,7 +89,7 @@ export async function analyzeCompany(input: AnalyzeInput): Promise<AnalyzeOutput
   const completion = await llm.complete(messages, {
     maxTokens: 800,
     webSearch: llmHasBuiltInSearch
-      ? { allowedDomains, searchContextSize: "medium" }
+      ? { allowedDomains, searchContextSize: "high" }
       : undefined,
   });
 
