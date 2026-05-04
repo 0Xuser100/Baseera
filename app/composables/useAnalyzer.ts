@@ -151,7 +151,20 @@ export const useAnalyzer = () => {
       batchRows.value = rows;
       batchRunning.value = true;
 
-      // 2. Process with limited concurrency (3 parallel)
+      // Pre-compute duplicates: map array-position -> primary array-position for same domain
+      const domainToPrimary = new Map<string, number>();
+      const duplicateOf = new Map<number, number>();
+      for (let i = 0; i < rows.length; i++) {
+        const key = rows[i]!.companyDomain;
+        if (!key) continue;
+        if (domainToPrimary.has(key)) {
+          duplicateOf.set(i, domainToPrimary.get(key)!);
+        } else {
+          domainToPrimary.set(key, i);
+        }
+      }
+
+      // 2. Process with limited concurrency
       const CONCURRENCY = 6;
       let cursor = 0;
 
@@ -161,7 +174,30 @@ export const useAnalyzer = () => {
           const row = batchRows.value[idx];
           if (!row) continue;
           row.status = "running";
-          batchRows.value = [...batchRows.value]; // trigger reactivity
+          batchRows.value = [...batchRows.value];
+
+          const primaryIdx = duplicateOf.get(idx);
+          if (primaryIdx !== undefined) {
+            // Wait for the primary row to finish, then copy its result
+            while (!batchCancelled.value) {
+              const primary = batchRows.value[primaryIdx];
+              if (!primary || primary.status === "done" || primary.status === "failed") break;
+              await new Promise((r) => setTimeout(r, 300));
+            }
+            const primary = batchRows.value[primaryIdx];
+            if (primary?.status === "done") {
+              row.status = "done";
+              row.answer = primary.answer;
+              row.sources = primary.sources;
+              row.latencyMs = primary.latencyMs;
+            } else {
+              row.status = "failed";
+              row.error = primary?.error ?? "Primary row failed";
+            }
+            batchRows.value = [...batchRows.value];
+            continue;
+          }
+
           const start = Date.now();
           try {
             const res = await $fetch<AnalyzeOutput>("/api/analyze", {
