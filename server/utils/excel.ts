@@ -6,6 +6,7 @@ export interface ParsedRow {
   domain?: string;
   website?: string;          // original raw URL from the spreadsheet
   extra: Record<string, unknown>;
+  originalRow: Record<string, unknown>; // all original columns, preserved for output
 }
 
 export function parseUploadedXlsx(buffer: ArrayBuffer): ParsedRow[] {
@@ -19,19 +20,19 @@ export function parseUploadedXlsx(buffer: ArrayBuffer): ParsedRow[] {
         Object.entries(row).map(([k, v]) => [k.toLowerCase().trim(), v])
       );
       const rawDomain =
-        String(lower.domain ?? lower.website ?? lower.url ?? "").trim() || undefined;
+        String(lower.website ?? lower.domain ?? lower.url ?? "").trim() || undefined;
       const domain = rawDomain ? extractDomain(rawDomain) : undefined;
       const nameRaw = String(
-        lower.name ?? lower.company ?? lower["company name"] ?? ""
+        lower.title ?? lower.name ?? lower.company ?? lower["company name"] ?? ""
       ).trim();
       // If no explicit name column, derive it from the domain
       const name = nameRaw || (domain ? domainToName(domain) : "");
       const extra: Record<string, unknown> = { ...row };
-      const recognized = ["name", "company", "company name", "domain", "website", "url"];
+      const recognized = ["title", "name", "company", "company name", "domain", "website", "url"];
       for (const k of Object.keys(row)) {
         if (recognized.includes(k.toLowerCase().trim())) delete extra[k];
       }
-      return { name, domain, website: rawDomain, extra };
+      return { name, domain, website: rawDomain, extra, originalRow: { ...row } };
     })
     .filter((r) => r.name.length > 0);
 }
@@ -60,9 +61,7 @@ export function generateResultsXlsx(
   const data = originalRows.map((row, i) => {
     const a = analyses[i];
     return {
-      ...row.extra,
-      "Company Name": row.name,
-      Domain: row.domain ?? "",
+      ...row.originalRow,
       Answer: a?.answer ?? "",
       Sources: (JSON.parse(a?.sources ?? "[]") as any[])
         .map((s: any) => s.url)

@@ -178,7 +178,7 @@ function buildLLMMessages(input: AnalyzeInput, results: SearchResult[]): LLMMess
     {
       role: "system",
       content:
-        "You are a business analyst. Answer the user's question about the company strictly using the research provided. Cite sources by [number].",
+        "You are a business analyst. Answer the user's question about the company strictly using the research provided. Do not cite sources or add reference numbers.",
     },
     {
       role: "user",
@@ -190,7 +190,7 @@ ${research}
 QUESTION:
 ${input.prompt}
 
-Respond concisely (under 200 words). End with a line: "Sources: [1], [3], ..."`,
+Respond concisely (under 200 words). Do not add a sources or citations line at the end.`,
     },
   ];
 }

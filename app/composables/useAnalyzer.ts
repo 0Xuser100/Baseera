@@ -30,11 +30,27 @@ export interface BatchRow {
   companyName: string;
   companyDomain?: string;
   extra: Record<string, unknown>;
+  originalRow: Record<string, unknown>;
   status: "queued" | "running" | "done" | "failed";
   answer?: string;
   sources?: { url: string; title: string }[];
   latencyMs?: number;
   error?: string;
+}
+
+function buildResultsXlsx(rows: BatchRow[]): ArrayBuffer {
+  const data = rows.map((r) => ({
+    ...r.originalRow,
+    Answer: r.answer ?? "",
+    Sources: (r.sources ?? []).map((s) => s.url).join(" | "),
+    Status: r.status,
+    "Latency (ms)": r.latencyMs ?? "",
+    Error: r.error ?? "",
+  }));
+  const ws = XLSX.utils.json_to_sheet(data);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Results");
+  return XLSX.write(wb, { type: "array", bookType: "xlsx" });
 }
 
 export const useAnalyzer = () => {
@@ -93,32 +109,31 @@ export const useAnalyzer = () => {
       if (!firstSheet) throw new Error("Empty xlsx file");
       const json = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet);
 
+      const RECOGNIZED = ["title", "name", "company", "company name", "domain", "website", "url"];
+
       const rows: BatchRow[] = json
         .map((row, i) => {
           const lower = Object.fromEntries(
             Object.entries(row).map(([k, v]) => [k.toLowerCase().trim(), v])
           );
           const rawName = String(
-            lower.name ?? lower.company ?? lower["company name"] ?? ""
+            lower.title ?? lower.name ?? lower.company ?? lower["company name"] ?? ""
           ).trim();
           const rawDomain = String(
-            lower.domain ?? lower.website ?? lower.url ?? ""
+            lower.website ?? lower.domain ?? lower.url ?? ""
           ).trim();
           const domain = cleanDomain(rawDomain);
-          // Fall back to deriving name from domain (e.g. "ejada.com" -> "Ejada")
           const name = rawName || (domain ? nameFromDomain(domain) : "");
           const extra = { ...row };
           for (const k of Object.keys(extra)) {
-            const lk = k.toLowerCase().trim();
-            if (["name", "company", "company name", "domain", "website", "url"].includes(lk)) {
-              delete extra[k];
-            }
+            if (RECOGNIZED.includes(k.toLowerCase().trim())) delete extra[k];
           }
           return {
             index: i,
             companyName: name,
             companyDomain: domain,
             extra,
+            originalRow: { ...row },
             status: "queued" as const,
           };
         })
@@ -126,7 +141,7 @@ export const useAnalyzer = () => {
 
       if (rows.length === 0) {
         throw new Error(
-          "No valid rows found. Need a 'name', 'company', 'domain', 'website' or 'url' column."
+          "No valid rows found. Need a 'Title', 'Website', 'name', 'company', 'domain', or 'url' column."
         );
       }
       if (rows.length > 1000) {
@@ -206,20 +221,7 @@ export const useAnalyzer = () => {
 
   function downloadBatchResults() {
     if (batchRows.value.length === 0) return;
-    const data = batchRows.value.map((r) => ({
-      ...r.extra,
-      "Company Name": r.companyName,
-      Domain: r.companyDomain ?? "",
-      Answer: r.answer ?? "",
-      Sources: (r.sources ?? []).map((s) => s.url).join(" | "),
-      Status: r.status,
-      "Latency (ms)": r.latencyMs ?? "",
-      Error: r.error ?? "",
-    }));
-    const ws = XLSX.utils.json_to_sheet(data);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Results");
-    const blob = XLSX.write(wb, { type: "array", bookType: "xlsx" });
+    const blob = buildResultsXlsx(batchRows.value);
     const url = URL.createObjectURL(new Blob([blob], { type: "application/octet-stream" }));
     const a = document.createElement("a");
     a.href = url;

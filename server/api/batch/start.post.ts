@@ -34,7 +34,7 @@ export default defineEventHandler(async (event) => {
   }
 
   if (rows.length === 0)
-    throw createError({ statusCode: 400, message: "No valid rows found. Ensure a 'name' or 'company' column exists." });
+    throw createError({ statusCode: 400, message: "No valid rows found. Ensure a 'Title', 'Website', 'name', or 'company' column exists." });
   if (rows.length > MAX_ROWS)
     throw createError({ statusCode: 400, message: `Too many rows (${rows.length}). Max is ${MAX_ROWS}.` });
 
