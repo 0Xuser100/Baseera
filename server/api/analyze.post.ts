@@ -6,15 +6,22 @@ import type { SearchProviderId, LLMProviderId } from "~/shared/types";
 export default defineEventHandler(async (event) => {
   const body = await readBody(event);
 
-  const companyName: string = body?.companyName?.trim();
+  const companyNameRaw: string | undefined = body?.companyName?.trim() || undefined;
   const companyDomain: string | undefined = body?.companyDomain?.trim() || undefined;
   const website: string | undefined = body?.website?.trim() || undefined;
+  const extraFields: Record<string, unknown> | undefined =
+    body?.extraFields && typeof body.extraFields === "object" ? body.extraFields : undefined;
   const prompt: string = body?.prompt?.trim();
   const searchProviderId: SearchProviderId = body?.searchProviderId ?? "tavily";
   const llmProviderId: LLMProviderId = body?.llmProviderId ?? "gpt-4o";
 
+  // The row needs *something* identifying the company (a name or a website)
+  // plus a prompt. Name is optional when a website is provided — the LLM
+  // sees the website + any extra columns and reasons from there.
+  const companyName = companyNameRaw || companyDomain || website || "";
+
   if (!companyName || !prompt) {
-    throw createError({ statusCode: 400, message: "companyName and prompt are required" });
+    throw createError({ statusCode: 400, message: "Either companyName or website is required, plus prompt" });
   }
 
   const env = event.context.cloudflare?.env as any ?? process.env;
@@ -25,6 +32,7 @@ export default defineEventHandler(async (event) => {
       companyName,
       companyDomain,
       website,
+      extraFields,
       prompt,
       searchProviderId,
       llmProviderId,
@@ -45,7 +53,7 @@ export default defineEventHandler(async (event) => {
       row_index: null,
       company_name: companyName,
       company_domain: companyDomain ?? null,
-      extra_input: null,
+      extra_input: extraFields ? JSON.stringify(extraFields) : null,
       status: "done",
       answer: result.answer,
       sources: JSON.stringify(result.sources),

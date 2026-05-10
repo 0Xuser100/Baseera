@@ -29,6 +29,7 @@ export interface BatchRow {
   index: number;
   companyName: string;
   companyDomain?: string;
+  website?: string;
   extra: Record<string, unknown>;
   originalRow: Record<string, unknown>;
   status: "queued" | "running" | "done" | "failed";
@@ -109,39 +110,82 @@ export const useAnalyzer = () => {
       if (!firstSheet) throw new Error("Empty xlsx file");
       const json = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet);
 
-      const RECOGNIZED = ["title", "name", "company", "company name", "domain", "website", "url"];
+      // The only column the system genuinely *needs* is the website (so we can
+      // do a web search). Every other column — whatever it is named — is
+      // forwarded verbatim to the LLM as labeled key/value context.
+      //
+      // Website-column detection is flexible: pick the first column whose
+      // header looks website-y (website / domain / url / site / homepage /
+      // web / link), case-insensitive. If none matches by name, fall back to
+      // the first column whose value looks like a URL or domain.
+      const WEB_HEADER_RE = /\b(website|domain|url|site|homepage|web|link)\b/i;
+      const URL_VALUE_RE = /^(https?:\/\/|www\.)|\.[a-z]{2,}(\/|$)/i;
+      // Social-media / generic-platform domains. A row whose only URL-shaped
+      // value points at one of these is NOT a corporate website — analyzing
+      // it would mean searching facebook.com / twitter.com etc. as if it
+      // were the company's own site, which is virtually never useful.
+      const SOCIAL_DOMAIN_RE =
+        /(^|\.)(facebook|fb|twitter|x|linkedin|instagram|youtube|tiktok|pinterest|threads|t|wa|whatsapp|telegram|reddit|medium|github|gitlab)\.(com|me|co|io)(\/|$)/i;
+      // Header names that explicitly identify a social profile column.
+      // Used so the value-based fallback never picks them up either.
+      const SOCIAL_HEADER_RE =
+        /\b(facebook|fb|twitter|x|linkedin|instagram|ig|youtube|yt|tiktok|pinterest|threads|whatsapp|telegram|reddit|medium|github|gitlab|social)\b/i;
+
+      function isCorporateUrl(v: string): boolean {
+        if (!URL_VALUE_RE.test(v)) return false;
+        return !SOCIAL_DOMAIN_RE.test(v);
+      }
+
+      function pickWebsiteKey(row: Record<string, unknown>): string | undefined {
+        const keys = Object.keys(row);
+        // Header pass: must match website-y keyword AND must NOT be a social
+        // header (so a column literally called "Facebook URL" never wins).
+        const byHeader = keys.find(
+          (k) => WEB_HEADER_RE.test(k) && !SOCIAL_HEADER_RE.test(k)
+        );
+        if (byHeader) {
+          const v = String(row[byHeader] ?? "").trim();
+          // If the value at the header-matched column is itself a social URL,
+          // skip it and fall through to the value-based search.
+          if (v.length > 0 && !SOCIAL_DOMAIN_RE.test(v)) return byHeader;
+        }
+        // Value-based fallback: first column with a non-social URL value,
+        // and whose header is not flagged as social.
+        return keys.find((k) => {
+          if (SOCIAL_HEADER_RE.test(k)) return false;
+          const v = String(row[k] ?? "").trim();
+          return v.length > 0 && isCorporateUrl(v);
+        });
+      }
 
       const rows: BatchRow[] = json
         .map((row, i) => {
-          const lower = Object.fromEntries(
-            Object.entries(row).map(([k, v]) => [k.toLowerCase().trim(), v])
-          );
-          const rawName = String(
-            lower.title ?? lower.name ?? lower.company ?? lower["company name"] ?? ""
-          ).trim();
-          const rawDomain = String(
-            lower.website ?? lower.domain ?? lower.url ?? ""
-          ).trim();
-          const domain = cleanDomain(rawDomain);
-          const name = rawName || (domain ? nameFromDomain(domain) : "");
-          const extra = { ...row };
-          for (const k of Object.keys(extra)) {
-            if (RECOGNIZED.includes(k.toLowerCase().trim())) delete extra[k];
-          }
+          const websiteKey = pickWebsiteKey(row);
+          const rawWebsite = websiteKey ? String(row[websiteKey] ?? "").trim() : "";
+          const domain = cleanDomain(rawWebsite);
+          // Display label only — derived from the domain. The LLM sees every
+          // original column (including any "name"/"company" column) inside
+          // `extra`, so the label here does not influence analysis.
+          const name = domain ? nameFromDomain(domain) : (rawWebsite || `Row ${i + 1}`);
+          // Pass every column to the LLM EXCEPT the website column itself
+          // (which is already represented as `companyDomain` / `website`).
+          const extra: Record<string, unknown> = { ...row };
+          if (websiteKey) delete extra[websiteKey];
           return {
             index: i,
             companyName: name,
             companyDomain: domain,
+            website: rawWebsite || undefined,
             extra,
             originalRow: { ...row },
             status: "queued" as const,
           };
         })
-        .filter((r) => r.companyName.length > 0);
+        .filter((r) => !!r.website);
 
       if (rows.length === 0) {
         throw new Error(
-          "No valid rows found. Need a 'Title', 'Website', 'name', 'company', 'domain', or 'url' column."
+          "No rows with a website were found. Each row needs at least one column containing a website URL or domain."
         );
       }
       if (rows.length > 1000) {
@@ -151,16 +195,19 @@ export const useAnalyzer = () => {
       batchRows.value = rows;
       batchRunning.value = true;
 
-      // Pre-compute duplicates: map array-position -> primary array-position for same domain
-      const domainToPrimary = new Map<string, number>();
+      // Pre-compute duplicates: map array-position -> primary array-position
+      // for rows pointing at the same site. Prefer the cleaned domain when
+      // available; otherwise dedupe on the raw website string.
+      const siteToPrimary = new Map<string, number>();
       const duplicateOf = new Map<number, number>();
       for (let i = 0; i < rows.length; i++) {
-        const key = rows[i]!.companyDomain;
+        const r = rows[i]!;
+        const key = (r.companyDomain || r.website || "").toLowerCase();
         if (!key) continue;
-        if (domainToPrimary.has(key)) {
-          duplicateOf.set(i, domainToPrimary.get(key)!);
+        if (siteToPrimary.has(key)) {
+          duplicateOf.set(i, siteToPrimary.get(key)!);
         } else {
-          domainToPrimary.set(key, i);
+          siteToPrimary.set(key, i);
         }
       }
 
@@ -205,6 +252,8 @@ export const useAnalyzer = () => {
               body: {
                 companyName: row.companyName,
                 companyDomain: row.companyDomain,
+                website: row.website,
+                extraFields: row.extra,
                 prompt: prompt.value,
                 searchProviderId: searchProvider.value,
                 llmProviderId: llmProvider.value,

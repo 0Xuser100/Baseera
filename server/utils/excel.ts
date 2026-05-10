@@ -14,27 +14,43 @@ export function parseUploadedXlsx(buffer: ArrayBuffer): ParsedRow[] {
   const sheet = wb.Sheets[wb.SheetNames[0]];
   const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet);
 
+  // Flexible column handling: the only column we actually need is the
+  // website (for web search). Every other column is forwarded to the LLM
+  // verbatim under its original header.
+  const WEB_HEADER_RE = /\b(website|domain|url|site|homepage|web|link)\b/i;
+  const URL_VALUE_RE = /^(https?:\/\/|www\.)|\.[a-z]{2,}(\/|$)/i;
+  const SOCIAL_DOMAIN_RE =
+    /(^|\.)(facebook|fb|twitter|x|linkedin|instagram|youtube|tiktok|pinterest|threads|t|wa|whatsapp|telegram|reddit|medium|github|gitlab)\.(com|me|co|io)(\/|$)/i;
+  const SOCIAL_HEADER_RE =
+    /\b(facebook|fb|twitter|x|linkedin|instagram|ig|youtube|yt|tiktok|pinterest|threads|whatsapp|telegram|reddit|medium|github|gitlab|social)\b/i;
+
+  function pickWebsiteKey(row: Record<string, unknown>): string | undefined {
+    const keys = Object.keys(row);
+    const byHeader = keys.find(
+      (k) => WEB_HEADER_RE.test(k) && !SOCIAL_HEADER_RE.test(k)
+    );
+    if (byHeader) {
+      const v = String(row[byHeader] ?? "").trim();
+      if (v.length > 0 && !SOCIAL_DOMAIN_RE.test(v)) return byHeader;
+    }
+    return keys.find((k) => {
+      if (SOCIAL_HEADER_RE.test(k)) return false;
+      const v = String(row[k] ?? "").trim();
+      return v.length > 0 && URL_VALUE_RE.test(v) && !SOCIAL_DOMAIN_RE.test(v);
+    });
+  }
+
   return rows
-    .map((row) => {
-      const lower = Object.fromEntries(
-        Object.entries(row).map(([k, v]) => [k.toLowerCase().trim(), v])
-      );
-      const rawDomain =
-        String(lower.website ?? lower.domain ?? lower.url ?? "").trim() || undefined;
-      const domain = rawDomain ? extractDomain(rawDomain) : undefined;
-      const nameRaw = String(
-        lower.title ?? lower.name ?? lower.company ?? lower["company name"] ?? ""
-      ).trim();
-      // If no explicit name column, derive it from the domain
-      const name = nameRaw || (domain ? domainToName(domain) : "");
+    .map((row, i) => {
+      const websiteKey = pickWebsiteKey(row);
+      const rawWebsite = websiteKey ? String(row[websiteKey] ?? "").trim() || undefined : undefined;
+      const domain = rawWebsite ? extractDomain(rawWebsite) : undefined;
+      const name = domain ? domainToName(domain) : (rawWebsite || `Row ${i + 1}`);
       const extra: Record<string, unknown> = { ...row };
-      const recognized = ["title", "name", "company", "company name", "domain", "website", "url"];
-      for (const k of Object.keys(row)) {
-        if (recognized.includes(k.toLowerCase().trim())) delete extra[k];
-      }
-      return { name, domain, website: rawDomain, extra, originalRow: { ...row } };
+      if (websiteKey) delete extra[websiteKey];
+      return { name, domain, website: rawWebsite, extra, originalRow: { ...row } };
     })
-    .filter((r) => r.name.length > 0);
+    .filter((r) => !!r.website);
 }
 
 function extractDomain(raw: string): string {

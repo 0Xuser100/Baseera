@@ -71,7 +71,18 @@ export async function analyzeCompany(input: AnalyzeInput): Promise<AnalyzeOutput
     results = searchOutput.results;
     allSources = searchOutput.allSources;
     searchSpan.end({
-      output: { citations: results.length, allSources: allSources.length },
+      output: {
+        citationCount: results.length,
+        allSourceCount: allSources.length,
+        // Full payload so the search results are visible in Langfuse, not
+        // just summary counts.
+        citations: results.map((r) => ({
+          url: r.url,
+          title: r.title,
+          snippet: (r.snippet ?? "").slice(0, 600),
+        })),
+        allSources,
+      },
     });
   }
 
@@ -128,10 +139,22 @@ export async function analyzeCompany(input: AnalyzeInput): Promise<AnalyzeOutput
 }
 
 function buildSearchQuery(input: AnalyzeInput): string {
-  const parts = [input.companyName];
+  // Always include the raw website URL — domain extraction can fail on
+  // malformed/edge URLs, and the URL itself is the most reliable lookup hint.
+  const parts: string[] = [];
+  if (input.companyName) parts.push(input.companyName);
   if (input.companyDomain) parts.push(input.companyDomain);
   if (input.website && input.website !== input.companyDomain) parts.push(input.website);
-  return parts.join(" ");
+  return parts.filter(Boolean).join(" ").trim() || (input.website ?? "");
+}
+
+function formatExtraFields(extra?: Record<string, unknown>): string {
+  if (!extra) return "";
+  const entries = Object.entries(extra)
+    .filter(([_, v]) => v !== undefined && v !== null && String(v).trim().length > 0)
+    .map(([k, v]) => `- ${k}: ${String(v).trim()}`);
+  if (entries.length === 0) return "";
+  return `ADDITIONAL ROW CONTEXT (from spreadsheet columns; treat as supplementary, not authoritative):\n${entries.join("\n")}\n\n`;
 }
 
 function collectAllowedDomains(input: AnalyzeInput): string[] {
@@ -161,7 +184,7 @@ function buildLLMMessagesNoResearch(input: AnalyzeInput): LLMMessage[] {
       role: "user",
       content: `COMPANY: ${input.companyName}${input.companyDomain ? ` (${input.companyDomain})` : ""}${input.website ? ` | Website: ${input.website}` : ""}
 
-QUESTION:
+${formatExtraFields(input.extraFields)}QUESTION:
 ${input.prompt}
 
 Respond concisely (under 200 words) with inline citations.`,
@@ -184,7 +207,7 @@ function buildLLMMessages(input: AnalyzeInput, results: SearchResult[]): LLMMess
       role: "user",
       content: `COMPANY: ${input.companyName}${input.companyDomain ? ` (${input.companyDomain})` : ""}${input.website ? ` | Website: ${input.website}` : ""}
 
-RESEARCH:
+${formatExtraFields(input.extraFields)}RESEARCH:
 ${research}
 
 QUESTION:
