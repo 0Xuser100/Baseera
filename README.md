@@ -179,48 +179,342 @@ npx wrangler deploy
 
 ## 🏗️ Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                          Browser (tab open)                      │
-│                                                                  │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │  Vue 3 page (index.vue)                                   │  │
-│  │  ├── Parses xlsx with SheetJS                             │  │
-│  │  ├── Loops rows, 6 in parallel                            │  │
-│  │  ├── For each row: POST /api/analyze                      │  │
-│  │  ├── Generates results.xlsx client-side (download)        │  │
-│  │  └── On finish: POST /api/notify (optional email)         │  │
-│  └─────────────────────────┬─────────────────────────────────┘  │
-└────────────────────────────┼────────────────────────────────────┘
-                             │  HTTPS
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       Cloudflare Edge                            │
-│                                                                  │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │   Nuxt 4 + Nitro (Worker)                               │   │
-│   │   ├── /api/analyze   → orchestrator + provider call     │   │
-│   │   ├── /api/notify    → Resend email                     │   │
-│   │   └── /api/health                                       │   │
-│   └────┬────────────────────────────────────────────────────┘   │
-│        │                                                         │
-│        ▼                                                         │
-│   ┌────────┐                                                     │
-│   │   D1   │  one row per analysis (audit log)                  │
-│   │(SQLite)│                                                     │
-│   └────────┘                                                     │
-└────────────────────────────┬─────────────────────────────────────┘
-                             │
-       ┌─────────────────────┼─────────────────────┬──────────┐
-       ▼                     ▼                     ▼          ▼
-  ┌─────────┐          ┌─────────────┐       ┌────────┐  ┌──────────┐
-  │ Tavily  │          │   OpenAI    │       │ Resend │  │ Langfuse │
-  │ search  │          │ Responses + │       │ email  │  │ tracing  │
-  │         │          │ web_search  │       │        │  │          │
-  └─────────┘          └─────────────┘       └────────┘  └──────────┘
+### High-Level System Topology
+
+The entire system is deployed as a single **Cloudflare Worker**. Frontend (Nuxt 4 / Vue 3) and backend (Nitro / H3) ship together.
+
+```mermaid
+graph TB
+    subgraph Browser["🖥️ Browser (Client)"]
+        UI["index.vue<br/>Vue 3 SPA"]
+        PS["ProviderSelector.vue"]
+        UZ["UploadZone.vue"]
+        RC["ResultCard.vue"]
+        UA["useAnalyzer.ts<br/>Composable"]
+        XLSX_C["SheetJS (xlsx)<br/>Client-side parsing"]
+    end
+
+    subgraph CF["☁️ Cloudflare Edge"]
+        subgraph Worker["Nuxt 4 + Nitro Worker"]
+            AUTH["auth.ts<br/>Basic Auth Middleware"]
+            API_A["POST /api/analyze"]
+            API_N["POST /api/notify"]
+            API_H["GET /api/health"]
+            ORCH["analyze.ts<br/>Core Orchestrator"]
+            DB_H["db.ts<br/>D1 Helpers"]
+            TRACE["tracing.ts<br/>Langfuse Client"]
+        end
+
+        subgraph Providers["Provider Layer"]
+            SP_IDX["Search Provider Factory"]
+            SP_TAV["TavilySearch"]
+            SP_OAI["OpenAISearch"]
+            LLM_IDX["LLM Provider Factory"]
+            LLM_OAI["OpenAI LLM<br/>gpt-4o / gpt-5.4-mini"]
+        end
+
+        D1[("D1 (SQLite)<br/>analyses table")]
+        R2[("R2 Bucket<br/>company-analyzer-files")]
+    end
+
+    subgraph External["🌐 External Services"]
+        TAVILY["Tavily API<br/>Web Search"]
+        OPENAI["OpenAI API<br/>Responses + Chat"]
+        RESEND["Resend API<br/>Email"]
+        LANGFUSE["Langfuse<br/>Observability"]
+    end
+
+    UI --> UA
+    PS --> UA
+    UZ --> UA
+    UA -->|"$fetch POST"| API_A
+    UA -->|"$fetch POST"| API_N
+    UA --> XLSX_C
+
+    AUTH -.->|"guards all routes<br/>(except /api/health)"| API_A
+    AUTH -.-> API_N
+
+    API_A --> ORCH
+    ORCH --> SP_IDX
+    ORCH --> LLM_IDX
+    ORCH --> TRACE
+    API_A --> DB_H
+
+    SP_IDX --> SP_TAV
+    SP_IDX --> SP_OAI
+    LLM_IDX --> LLM_OAI
+
+    SP_TAV -->|"HTTPS"| TAVILY
+    SP_OAI -->|"HTTPS"| OPENAI
+    LLM_OAI -->|"HTTPS"| OPENAI
+    API_N -->|"HTTPS"| RESEND
+    TRACE -->|"HTTPS"| LANGFUSE
+    DB_H --> D1
+
+    RC --> UI
 ```
 
-> The dotted-out `R2 bucket` and `Queues + Consumer` from the original design are **still in the codebase** (`server/utils/queue-processor.ts`, `server/api/batch/*`) but disabled in `wrangler.toml`. Uncomment them and recreate the queues to switch back to server-side batch.
+### Individual Analysis — Request Flow
+
+Single company analysis: user fills form → `POST /api/analyze` → search → LLM → response.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Vue as index.vue
+    participant Comp as useAnalyzer
+    participant Auth as auth.ts Middleware
+    participant API as POST /api/analyze
+    participant Orch as analyzeCompany()
+    participant Search as Search Provider
+    participant LLM as LLM Provider
+    participant DB as D1 Database
+    participant LF as Langfuse
+
+    User->>Vue: Enter company + prompt, click Analyze
+    Vue->>Comp: runIndividual()
+    Comp->>API: $fetch POST /api/analyze
+    API->>Auth: Request intercepted
+    Auth-->>API: ✓ Authorized (Basic Auth)
+
+    API->>Orch: analyzeCompany(input)
+    Orch->>LF: trace.start("analyzeCompany")
+
+    alt Path A — OpenAI Built-in Search
+        Orch->>LLM: complete(messages, webSearch config)
+        LLM->>LLM: Model runs web_search tool internally
+        LLM-->>Orch: text + citations + allSources
+    else Path B — Tavily Two-Step
+        Orch->>Search: search(query, allowedDomains)
+        Search-->>Orch: SearchResult[] (max 8)
+        Orch->>LF: span("web-search")
+        Orch->>LLM: complete(messages with research context)
+        LLM-->>Orch: text + token counts
+    end
+
+    Orch->>LF: generation("llm-completion")
+    Orch->>LF: flushAsync()
+    Orch-->>API: AnalyzeOutput
+
+    API->>DB: insertAnalysis(result)
+    API-->>Comp: { id, answer, sources, latencyMs }
+    Comp-->>Vue: Update result state
+    Vue->>User: Render ResultCard
+```
+
+### Batch Analysis — Browser-Side Flow
+
+Batch mode: the browser orchestrates everything. No server-side queues needed.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Vue as index.vue
+    participant Comp as useAnalyzer
+    participant XLSX as SheetJS (browser)
+    participant API as POST /api/analyze
+    participant Notify as POST /api/notify
+    participant Resend as Resend API
+
+    User->>Vue: Upload .xlsx + enter prompt
+    User->>Vue: Click "Start Batch"
+    Vue->>Comp: startBatch()
+
+    Comp->>XLSX: Read file ArrayBuffer
+    XLSX-->>Comp: Parsed rows[]
+    Note over Comp: Detect website column<br/>Clean domains<br/>Derive company names<br/>Detect duplicates<br/>Max 1,000 rows
+
+    Comp->>Comp: Spawn 6 worker coroutines
+
+    par Worker 1..6 (concurrent)
+        loop Each row from queue
+            alt Duplicate row
+                Comp->>Comp: Wait for primary row result
+                Comp->>Comp: Copy primary's answer
+            else Unique row
+                Comp->>API: POST /api/analyze (per row)
+                API-->>Comp: { answer, sources, latencyMs }
+            end
+            Comp->>Vue: Update batchRows[] (reactive)
+            Vue->>User: Progress bar + table update
+        end
+    end
+
+    Note over Comp: All rows processed
+
+    opt Email provided & not cancelled
+        Comp->>Notify: POST /api/notify (summary)
+        Notify->>Resend: Send completion email
+    end
+
+    User->>Vue: Click "Download results.xlsx"
+    Comp->>XLSX: buildResultsXlsx(rows)
+    XLSX-->>User: Browser download .xlsx
+```
+
+### AI Provider Strategy — Decision Tree
+
+The orchestrator picks a fundamentally different execution path based on the user's search provider choice.
+
+```mermaid
+flowchart TD
+    START(["User request arrives<br/>at analyzeCompany()"])
+    CHECK{"searchProviderId<br/>== 'openai'?"}
+    LLM_CHECK{"llmProviderId ∈<br/>{gpt-4o, gpt-5.4-mini}?"}
+
+    subgraph PathA["Path A: Single-Call Agentic"]
+        A1["Build system + user messages<br/>(no pre-fetched research)"]
+        A2["Call OpenAI Responses API<br/>with web_search tool attached"]
+        A3["Model autonomously searches<br/>allowed_domains filter applied"]
+        A4["Extract citations +<br/>allSources from response"]
+    end
+
+    subgraph PathB["Path B: Two-Step Search → LLM"]
+        B1["getSearchProvider(id)"]
+        B2{"Provider?"}
+        B3["TavilySearch.search()<br/>include_domains filter<br/>max 8 results"]
+        B4["OpenAISearch.search()<br/>(standalone search)"]
+        B5["Build messages with<br/>numbered research context"]
+        B6["Call LLM via Chat Completions<br/>temp=0.3, max_tokens=800"]
+    end
+
+    DONE(["Return AnalyzeOutput<br/>answer + sources + latency"])
+
+    START --> CHECK
+    CHECK -->|Yes| LLM_CHECK
+    CHECK -->|No| PathB
+    LLM_CHECK -->|Yes| PathA
+    LLM_CHECK -->|No| PathB
+
+    A1 --> A2 --> A3 --> A4 --> DONE
+    B1 --> B2
+    B2 -->|"tavily"| B3
+    B2 -->|"openai"| B4
+    B3 --> B5
+    B4 --> B5
+    B5 --> B6 --> DONE
+```
+
+### Server-Side Batch (Disabled — In Codebase)
+
+These components exist in the codebase but are **disabled** in `wrangler.toml`. Requires Cloudflare Workers Paid ($5/mo). Uncomment the `[[queues.*]]` blocks to re-enable.
+
+```mermaid
+flowchart LR
+    subgraph Disabled["⛔ Disabled — Uncomment in wrangler.toml"]
+        CLIENT["Browser"] -->|"POST /api/batch/start"| START_EP["start.post.ts<br/>Parse xlsx, insert DB rows"]
+        START_EP --> D1_B[("D1<br/>batches + analyses")]
+        START_EP --> R2_UP[("R2<br/>Upload xlsx")]
+        START_EP -->|"Enqueue each row"| QUEUE["Cloudflare Queue<br/>analysis-jobs"]
+
+        QUEUE --> CONSUMER["cloudflare-queue.ts<br/>Nitro Plugin"]
+        CONSUMER --> QP["queue-processor.ts"]
+        QP --> ANALYZE["analyzeCompany()"]
+        QP --> D1_B
+        QP -->|"All rows done?"| FINALIZE["finalizeBatch()"]
+        FINALIZE --> R2_DL[("R2<br/>results.xlsx")]
+        FINALIZE --> EMAIL["email.ts<br/>sendBatchCompleteEmail()"]
+        EMAIL -->|"HTTPS"| RESEND["Resend API"]
+
+        DLQ["Dead Letter Queue<br/>analysis-jobs-dlq"]
+        QUEUE -.->|"max_retries: 3"| DLQ
+
+        CLIENT -->|"GET /api/batch/:id"| STATUS["[id]/index.get.ts"]
+        STATUS --> D1_B
+        CLIENT -->|"GET /api/batch/:id/download"| DL["[id]/download.get.ts"]
+        DL --> R2_DL
+    end
+```
+
+### Data Model — D1 Schema
+
+```mermaid
+erDiagram
+    BATCHES {
+        text id PK "ULID"
+        integer created_at "epoch ms"
+        text status "running | completed | failed | cancelled"
+        integer total_rows
+        integer done_rows "default 0"
+        integer failed_rows "default 0"
+        text prompt
+        text search_provider "tavily | openai"
+        text llm_provider "gpt-4o | gpt-5.4-mini-..."
+        text email "nullable — notification addr"
+        text upload_r2_key "nullable — original xlsx"
+        text result_r2_key "nullable — results xlsx"
+        integer completed_at "nullable — epoch ms"
+    }
+
+    ANALYSES {
+        text id PK "ULID"
+        text batch_id FK "nullable — null for individual"
+        integer row_index "nullable — position in batch"
+        integer created_at "epoch ms"
+        text company_name
+        text company_domain "nullable"
+        text extra_input "nullable — JSON extra columns"
+        text status "queued | running | done | failed"
+        text answer "nullable"
+        text sources "nullable — JSON array"
+        text search_provider
+        text llm_provider
+        integer latency_ms "nullable"
+        text error "nullable"
+    }
+
+    BATCHES ||--o{ ANALYSES : "has many"
+```
+
+### Frontend Component Hierarchy
+
+```mermaid
+graph TD
+    subgraph Nuxt["Nuxt 4 App Shell"]
+        APP["app.vue<br/>NuxtPage router-view"]
+    end
+
+    subgraph Page["index.vue (single page)"]
+        HEADER["Header<br/>Logo + Title"]
+        MODE["Mode Toggle<br/>Individual | Batch"]
+        SUBMIT["Submit / Cancel Button"]
+        ERROR["Error Banner"]
+        PROGRESS["Batch Progress Panel<br/>Progress bar + stats"]
+        TABLE["Results Table<br/>Row-by-row status"]
+        MODAL["Result Detail Modal<br/>Full answer + sources"]
+    end
+
+    subgraph Components["Reusable Components"]
+        PS_C["ProviderSelector.vue<br/>Search + LLM dropdowns"]
+        UZ_C["UploadZone.vue<br/>Drag & drop xlsx"]
+        RC_C["ResultCard.vue<br/>Individual result display"]
+    end
+
+    subgraph State["Shared State (useAnalyzer composable)"]
+        S1["mode: individual | batch"]
+        S2["prompt, searchProvider, llmProvider"]
+        S3["companyName, companyDomain, email, file"]
+        S4["result, loading, error"]
+        S5["batchRows[], batchRunning, batchCancelled"]
+        S6["runIndividual(), startBatch()"]
+        S7["cancelBatch(), downloadBatchResults()"]
+    end
+
+    APP --> Page
+    Page --> PS_C
+    Page --> UZ_C
+    Page --> RC_C
+    Page --> PROGRESS
+    Page --> TABLE
+    Page --> MODAL
+
+    PS_C -.->|"v-model"| S2
+    UZ_C -.->|"v-model"| S3
+    RC_C -.->|"props"| S4
+    MODE -.->|"v-model"| S1
+    TABLE -.->|"reads"| S5
+    SUBMIT -.->|"calls"| S6
+```
 
 ---
 
