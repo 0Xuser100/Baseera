@@ -1,5 +1,7 @@
 # 🔍 Baseera — Company Analyzer
 
+![Baseera — AI Company Research Platform](assets/banner.webp)
+
 > **AI-powered company research at scale.** Feed it a company website, ask anything, and get a sourced answer in seconds. Built for sales-qualification workflows where you need to screen hundreds of leads quickly.
 
 <p align="center">
